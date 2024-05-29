@@ -12,8 +12,22 @@ from app.config import configure_logging
 configure_logging()
 storage_map = {}
 
+def requires_auth(f):
+    """装饰器函数，用于保护需要认证的路由"""
+    def decorated(*args, **kwargs):
+        authorization = request.headers.get('Authorization')
+        accesstoken = os.getenv('ACCESS_TOKEN')
+        try:
+            prefix, token = authorization.split()
+            if prefix.lower() != "bearer" or token != accesstoken:
+                return Response('Invalid Access Token', 401)
+        except:
+            return Response('Authorization Failed', 401)
+        return f(*args, **kwargs)
+    return decorated
 
-@app.route("/v1/chat/completions", methods=["GET", "POST", "OPTIONS"])
+@app.route("/yyds/v1/chat/completions", methods=["GET", "POST", "OPTIONS"])
+@requires_auth
 def onRequest():
     try:
         return fetch(request)
@@ -22,7 +36,7 @@ def onRequest():
         return handle_error(e)
 
 
-@app.route('/v1/models')
+@app.route('/yyds/v1/models')
 def list_models():
     return {
         "object": "list",
