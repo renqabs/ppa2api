@@ -4,14 +4,17 @@ import imghdr
 import json
 import logging
 import os
+import re
 from collections import deque
 
 import requests
 from flask import Response, jsonify
+from requests.exceptions import ProxyError
 
-from app.config import configure_logging
+from app.config import configure_logging, IMAGE_MODEL_NAMES, ProxyPool
 
 configure_logging()
+proxy_pool = ProxyPool()
 current_token_index = 0
 
 
@@ -29,7 +32,8 @@ def get_env_variable(var_name):
     return os.getenv(var_name)
 
 
-def send_chat_message(req, auth_token, channel_id, final_user_content, model_name, user_stream, image_url):
+def send_chat_message(req, auth_token, channel_id, final_user_content, model_name, user_stream, image_url,
+                      user_model_name):
     logging.info("Channel ID: %s", channel_id)
     # logging.info("Final User Content: %s", final_user_content)
     logging.info("Model Name: %s", model_name)
@@ -79,13 +83,13 @@ def send_chat_message(req, auth_token, channel_id, final_user_content, model_nam
     }
 
     try:
-        response = requests.post(url, headers=headers, json=data, stream=True)
+        response = request_with_proxy_chat(url, headers, data, True)
         if response.headers.get('Content-Type') == 'text/event-stream;charset=UTF-8':
             if not user_stream:
-                return stream_2_json(response, model_name)
+                return stream_2_json(response, model_name, user_model_name)
             return stream_response(response, model_name)
         else:
-            return stream_2_json(response, model_name)
+            return stream_2_json(response, model_name, user_model_name)
     except requests.exceptions.RequestException as e:
         logging.error("send_chat_message error: %s", e)
         return handle_error(e)
@@ -101,7 +105,7 @@ def stream_response(resp, model_name):
             content = message.get("content", "")
             wrapped_chunk = {
                 "id": message_id,
-                "object": objectid,
+                "object": "chat.completion",
                 "created": 0,
                 "model": model_name,
                 "choices": [
@@ -115,9 +119,9 @@ def stream_response(resp, model_name):
                     }
                 ],
                 "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0
+                    "prompt_tokens": 13,
+                    "completion_tokens": 7,
+                    "total_tokens": 20
                 },
                 "system_fingerprint": None
             }
@@ -128,7 +132,7 @@ def stream_response(resp, model_name):
     return Response(generate(), mimetype='text/event-stream; charset=UTF-8')
 
 
-def stream_2_json(resp, model_name):
+def stream_2_json(resp, model_name, user_model_name):
     logging.info("Entering stream_2_json function")
 
     chunks = []
@@ -139,29 +143,37 @@ def stream_2_json(resp, model_name):
         objectid = message.get("chunkId", "")
         content = message.get("content", "")
         merged_content += content
-
-        wrapped_chunk = {
-            "id": message_id,
-            "object": objectid,
-            "created": 0,
-            "model": model_name,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {
-                        "role": "assistant",
-                        "content": merged_content
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0
-            },
-            "system_fingerprint": None
-        }
+        if user_model_name in IMAGE_MODEL_NAMES:
+            # 如果 model_name 在 IMAGE_MODEL_NAMES 内，转换为包含 URL 的格式
+            wrapped_chunk = {
+                "created": 0,
+                "data": [
+                    {"url": extract_url_from_content(merged_content)}
+                ]
+            }
+        else:
+            wrapped_chunk = {
+                "id": message_id,
+                "object": "chat.completion",
+                "created": 0,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": merged_content
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 13,
+                    "completion_tokens": 7,
+                    "total_tokens": 20
+                },
+                "system_fingerprint": None
+            }
         append_to_chunks(wrapped_chunk)
 
     logging.info("Exiting stream_2_json function")
@@ -201,8 +213,7 @@ def upload_image_to_telegraph(base64_string):
 
         mime_type = f"image/{image_type}"
         files = {'file': (f'image.{image_type}', image_data, mime_type)}
-        response = requests.post('https://telegra.ph/upload', files=files)
-
+        response = request_with_proxy_image('https://telegra.ph/upload', files=files)
         response.raise_for_status()
         json_response = response.json()
         if isinstance(json_response, list) and 'src' in json_response[0]:
@@ -305,7 +316,7 @@ def fetch_channel_id(auth_token, model_name, content, template_id):
     }
 
     try:
-        response = requests.post(url, headers=headers, json=data)
+        response = request_with_proxy_chat(url, headers, data, False)
         response.raise_for_status()
         response_data = response.json()
         return response_data.get('data', {}).get('channelId')
@@ -386,3 +397,32 @@ def get_request_parameters(body):
     prompt = body.get("prompt", False)
     stream = body.get("stream", False)
     return messages, model_name, prompt, stream
+
+
+def extract_url_from_content(content):
+    # 使用正则表达式从 Markdown 内容中提取 URL
+    match = re.search(r'\!\[.*?\]\((.*?)\)', content)
+    return match.group(1) if match else content
+
+
+def request_with_proxy_image(url, files):
+    return request_with_proxy(url, None, None, False, files)
+
+
+def request_with_proxy_chat(url, headers, data, stream):
+    return request_with_proxy(url, headers, data, stream, None)
+
+
+def request_with_proxy(url, headers, data, stream, files):
+    try:
+        proxies = proxy_pool.get_random_proxy()
+        logging.info("Use proxy url %s", proxies)
+
+        if proxies:
+            response = requests.post(url, headers=headers, json=data, stream=stream, files=files, proxies=proxies)
+        else:
+            response = requests.post(url, headers=headers, json=data, stream=stream, files=files)
+    except ProxyError as e:
+        logging.error(f"Proxy error occurred: {e}")
+        raise Exception("Proxy error occurred")
+    return response
