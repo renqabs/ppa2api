@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timedelta
-
+import os
 from flask import request, Response, current_app as app
 
 from app.config import IGNORED_MODEL_NAMES, IMAGE_MODEL_NAMES, AUTH_TOKEN, HISTORY_MSG_LIMIT
